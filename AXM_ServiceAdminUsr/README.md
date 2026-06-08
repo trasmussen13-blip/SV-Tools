@@ -1,50 +1,63 @@
 # AXM Service Admin Setup
 
-This folder contains the PowerShell script used to create a local AXM service account and assign it to all AXM services.
+This folder contains PowerShell scripts used to create and manage a local AXM service account and assign it to all AXM-related services.
 
 ## Files
 
-- `AXMserviceuser.ps1` - Creates or updates the local service account `svcaxm_usr`, grants it service logon rights, and configures AXM services to run under that account.
-- `AXMserviceuserCleanup.ps1` - Removes the local service account and optionally deletes the saved password file.
-- `RunAXMserviceuser.bat` - Helper batch file that elevates if needed and runs `AXMserviceuser.ps1`.
+- `AXMserviceuser.ps1`  
+  Creates or updates the local service account `svcaxm_usr`, grants service logon rights, assigns it to AXM services, configures service logons, restarts services, and validates final state.
+
+- `AXMserviceuserCleanup.ps1`  
+  Removes the local service account and optionally cleans up related configuration.
+
+- `RunAXMserviceuser.bat`  
+  Helper batch file that elevates privileges if required and runs `AXMserviceuser.ps1`.
 
 ## Purpose
 
 The script automates:
 
-- creating or resetting a local service user (`svcaxm_usr`)
-- generating and saving a random password to a file named `<hostname>-password.txt`
-- setting the account password to never expire
-- granting the account "Log On As A Service"
-- assigning the account to all services matching `axm*`
-- granting file and registry permissions for the service binaries and registry keys
-- restarting the relevant services
+- Create or reset local service user (`svcaxm_usr`)
+- Generate random runtime password (not saved to disk)
+- Set password to never expire
+- Grant "Log On As A Service"
+- Assign to services:
+  - axm*
+  - vnhost*
+  - comnode*
+  - CommNodeSrv
+  - VnHostSrv
+- Configure services using CIM/WMI with fallback to `sc.exe`
+- Restart services in dependency-aware order
+- Validate final state
 
 ## Requirements
 
-- Windows
-- Administrative privileges
-- PowerShell with `Get-LocalUser`, `New-LocalUser`, `Get-LocalGroup`, `Add-LocalGroupMember`, `Get-Service`, and CIM access
+- Windows Server / Windows 10/11
+- Administrator rights
+- PowerShell with:
+  - Get-LocalUser
+  - New-LocalUser
+  - Set-LocalUser
+  - Get-Service
+  - Get-CimInstance
+  - Invoke-CimMethod
+  - sc.exe
 
 ## Usage
 
-1. Open PowerShell as Administrator.
-2. Navigate to the folder containing `AXMserviceuser.ps1`.
-3. Run either:
+1. Open PowerShell as Administrator  
+2. Navigate to folder  
+3. Run:
 
-```powershell
-.\AXMserviceuser.ps1
-```
+    .\AXMserviceuser.ps1
 
-or use the provided batch launcher:
+or run:
 
-```batch
-RunAXMserviceuser.bat
-```
+    RunAXMserviceuser.bat
 
 ## Notes
 
-- The script saves the generated password to a file named `<hostname>-password.txt` in the same folder.
-- If the AXM service user already exists, the script resets the password and reconfigures the service account.
-- The script now attempts to configure the service account with CIM/WMI first, and only falls back to `sc.exe` if needed.
-- Run the script from an elevated PowerShell session to avoid permission errors.
+- Password is generated per run and NOT stored
+- Script is idempotent in service configuration
+- Designed for controlled admin environments only
