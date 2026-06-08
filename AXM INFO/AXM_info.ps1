@@ -25,7 +25,9 @@ param(
     [switch]$SQL,
     [switch]$MainDB,
     [switch]$Repository,
-    [switch]$All
+    [switch]$All,
+    [switch]$Dump,
+    [string]$OutFile = "$env:COMPUTERNAME - AXM-info.txt"
 )
 
 function Get-ServiceListeningPorts {
@@ -187,15 +189,22 @@ function Get-LockSysMgrRepositoryInfo {
             $hasLog = Test-Path (Join-Path $subfolder.FullName 'lsmax_log.ldf')
             $status = if ($hasMdf -and $hasLog) { 'OK' } else { 'Missing' }
 
+            $mdfPath = Join-Path $subfolder.FullName 'lsmax.mdf'
+            $mdfInfo = if (Test-Path $mdfPath) { Get-Item -Path $mdfPath -ErrorAction SilentlyContinue } else { $null }
+
             $results += [PSCustomObject]@{
-                Repository      = $repo.Name
-                RepositorySize  = $repoSizeText
-                SubfolderName   = $relativeName
-                SubfolderSize   = $subfolderSizeText
-                FullPath        = $subfolder.FullName
-                Status          = $status
-                LsmaxMdf        = $hasMdf
-                LsmaxLogMdf     = $hasLog
+                Repository             = $repo.Name
+                RepositorySize         = $repoSizeText
+                SubfolderName          = $relativeName
+                SubfolderSize          = $subfolderSizeText
+                FullPath               = $subfolder.FullName
+                Status                 = $status
+                LsmaxMdf               = $hasMdf
+                LsmaxMdfName           = if ($mdfInfo) { $mdfInfo.Name } else { $null }
+                LsmaxMdfLength         = if ($mdfInfo) { $mdfInfo.Length } else { $null }
+                LsmaxMdfCreationTime   = if ($mdfInfo) { $mdfInfo.CreationTime } else { $null }
+                LsmaxMdfLastWriteTime  = if ($mdfInfo) { $mdfInfo.LastWriteTime } else { $null }
+                LsmaxLogMdf            = $hasLog
             }
         }
     }
@@ -316,12 +325,50 @@ function Show-Usage {
     Write-Host "If no switch is provided, the script runs Services, Software, SQL, MainDB, and Repository checks." -ForegroundColor Yellow
 }
 
-if (-not ($Services -or $Software -or $SQL -or $MainDB -or $Repository -or $All)) {
-    $Services = $true
-    $Software = $true
-    $SQL = $true
-    $MainDB = $true
-    $Repository = $true
+# If no arguments were provided, offer an interactive prompt to select checks.
+$noArgs = -not ($Services -or $Software -or $SQL -or $MainDB -or $Repository -or $All)
+$dumpConfirmed = $false
+if ($noArgs) {
+    try {
+        $runAllAnswer = Read-Host "No arguments provided. Run all checks? (Y/N) [Y]"
+        if ($runAllAnswer -and $runAllAnswer -match '^(?i:n|no)$') {
+            $svcAns = Read-Host "Run Services? (Y/N) [Y]"
+            $Services = -not ($svcAns -and $svcAns -match '^(?i:n|no)$')
+
+            $softAns = Read-Host "Run Software scan? (Y/N) [Y]"
+            $Software = -not ($softAns -and $softAns -match '^(?i:n|no)$')
+
+            $sqlAns = Read-Host "Run SQL instance scan? (Y/N) [Y]"
+            $SQL = -not ($sqlAns -and $sqlAns -match '^(?i:n|no)$')
+
+            $mainAns = Read-Host "Run Main DB config scan? (Y/N) [Y]"
+            $MainDB = -not ($mainAns -and $mainAns -match '^(?i:n|no)$')
+
+            $repoAns = Read-Host "Run Repository scan? (Y/N) [Y]"
+            $Repository = -not ($repoAns -and $repoAns -match '^(?i:n|no)$')
+
+            $dumpAns = Read-Host "Save report to file? (Y/N) [N]"
+            if ($dumpAns -and $dumpAns -match '^(?i:y|yes)$') {
+                $Dump = $true
+                $dumpConfirmed = $true
+                $customOut = Read-Host "Output filename (press Enter to use default: $OutFile)"
+                if ($customOut) { $OutFile = $customOut }
+            }
+        } else {
+            $Services = $true
+            $Software = $true
+            $SQL = $true
+            $MainDB = $true
+            $Repository = $true
+        }
+    } catch {
+        # Non-interactive host (Read-Host unavailable) — fall back to previous behavior
+        $Services = $true
+        $Software = $true
+        $SQL = $true
+        $MainDB = $true
+        $Repository = $true
+    }
 }
 
 if ($All) {
@@ -330,6 +377,63 @@ if ($All) {
     $SQL = $true
     $MainDB = $true
     $Repository = $true
+}
+
+# Handle optional dumping of script output to a file using Start-Transcript
+$transcribing = $false
+if (-not $Dump) {
+    # If Dump wasn't provided on the CLI, offer to save now (works for interactive and non-interactive selections when host supports Read-Host)
+    try {
+        $saveNow = Read-Host "Save report to file? (Y/N)"
+        if ($saveNow -and $saveNow -match '^(?i:y|yes)$') {
+            $Dump = $true
+            $dumpConfirmed = $true
+            $customOut = Read-Host "Output filename (press Enter to use default: $OutFile)"
+            if ($customOut) { $OutFile = $customOut }
+        }
+    } catch {
+        # Read-Host not available; do nothing
+    }
+}
+
+if ($Dump) {
+    $outfileFull = Join-Path (Get-Location).Path $OutFile
+
+    if ($dumpConfirmed) {
+        try {
+            Start-Transcript -Path $outfileFull -Force -ErrorAction Stop
+            $transcribing = $true
+            $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+            Write-Host "=== AXM Info Report ==="
+            Write-Host "Timestamp: $timestamp"
+        } catch {
+            Write-Warning "Failed to start transcript to '$outfileFull': $($_.Exception.Message)"
+        }
+    } else {
+        $saveReport = $true
+        try {
+            $answer = Read-Host "Save report to '$outfileFull'? (Y/N)"
+            if ($answer -and $answer -match '^(?i:n|no)$') {
+                $saveReport = $false
+            }
+        } catch {
+            Write-Verbose "Read-Host unavailable; defaulting to save report."
+        }
+
+        if (-not $saveReport) {
+            Write-Host "Skipping report save as requested." -ForegroundColor Yellow
+        } else {
+            try {
+                Start-Transcript -Path $outfileFull -Force -ErrorAction Stop
+                $transcribing = $true
+                $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+                Write-Host "=== AXM Info Report ==="
+                Write-Host "Timestamp: $timestamp"
+            } catch {
+                Write-Warning "Failed to start transcript to '$outfileFull': $($_.Exception.Message)"
+            }
+        }
+    }
 }
 
 if (-not ($Services) -and -not ($Software) -and -not ($SQL) -and -not ($MainDB) -and -not ($Repository)) {
@@ -384,5 +488,14 @@ if ($SQL) {
         $sqlResults | Select-Object InstanceName, InstanceType, Edition, Version, ServiceName, ServiceStatus | Format-Table -AutoSize
     } else {
         Write-Host "No SQL Server or LocalDB instances detected." -ForegroundColor Yellow
+    }
+}
+
+if ($transcribing) {
+    try {
+        Stop-Transcript | Out-Null
+        Write-Host "\nDump saved to: $outfileFull" -ForegroundColor Green
+    } catch {
+        Write-Warning "Failed to stop transcript: $($_.Exception.Message)"
     }
 }

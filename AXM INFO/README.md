@@ -1,47 +1,50 @@
-# SV-Tools — AXM Service Admin User Utility
+# AXM Info Tool
 
-Small Windows tooling for creating and cleaning up an AXM service account used for automated tasks.
+This README covers the AXM info inspection tool located in this folder.
 
-Contents
-- `AXM INFO/` — informational files related to AXM.
-- `AXM_ServiceAdminUsr/` — the main tooling and scripts:
-  - `AXMserviceuser.ps1` — PowerShell script to create/configure the AXM service user.
-  - `AXMserviceuserCleanup.ps1` — PowerShell script to remove the service user and cleanup.
-  - `RunAXMserviceuser.bat` — convenience batch wrapper to run the PowerShell script.
+## What it does
 
-Prerequisites
-- Windows 10/11 or Windows Server
-- PowerShell 5.1+ (or PowerShell Core if adapted)
-- Administrator privileges to create users and modify local/group policies
+`AXM_info.ps1` scans a Windows host for AXM-related configuration and environment details, including:
 
-Quick start
-1. Open an elevated PowerShell prompt (Run as Administrator).
-2. To create the AXM service user, either run the batch wrapper or call the script directly:
+- AXM/SimonsVoss Windows services
+- installed AXM-related software
+- SQL Server and LocalDB instances
+- LockSysMgr `main_*` configuration entries
+- SimonsVoss repository folders and MDF/LOG presence
+
+## Usage
+
+From an elevated PowerShell prompt, run:
 
 ```powershell
-.
-# from repo root
-.\AXM_ServiceAdminUsr\RunAXMserviceuser.bat
-
-# or directly
-PowerShell -ExecutionPolicy Bypass -File .\AXM_ServiceAdminUsr\AXMserviceuser.ps1
+PowerShell -ExecutionPolicy Bypass -File .\AXM_info.ps1
 ```
 
-3. To remove the created account and perform cleanup:
+If run without arguments, the script prompts for which checks to perform and whether to save a report.
+
+## Arguments
+
+- `-Services` — scan for AXM-related Windows services
+- `-Software` — scan installed applications for AXM/SimonsVoss entries
+- `-SQL` — scan for SQL Server and LocalDB instances
+- `-MainDB` — inspect LockSysMgr `main_*` configuration entries
+- `-Repository` — scan SimonsVoss repository folders and MDF/LOG presence
+- `-All` — run all checks
+- `-Dump` — prompt to save the report to a file
+- `-OutFile <path>` — specify the report filename (default: `Hostname - AXM-info.txt`)
+
+The script also supports `RunAXMinfo.bat` from the repository root, which normalizes argument formats and requests elevation.
+
+## Example
 
 ```powershell
-PowerShell -ExecutionPolicy Bypass -File .\AXM_ServiceAdminUsr\AXMserviceuserCleanup.ps1
+PowerShell -ExecutionPolicy Bypass -File .\AXM_info.ps1 -Services -SQL -Dump -OutFile "Hostname - AXM-info.txt"
 ```
 
-Notes
-- Review the scripts before running; they require administrative access and will create/modify accounts and policies.
-- Customize the scripts to match your environment (naming conventions, OU paths, password handling).
+## Notes
 
-Contributing
-- Improvements, bug fixes, and documentation updates are welcome. Please open an issue or submit a pull request.
-
-License
-- Add your preferred license file (e.g., `LICENSE`) at the repository root. This repository currently has no license included — add one if you plan to make it public.
+- Use an elevated prompt if you want the script to scan service and registry details.
+- The report file includes a timestamp header when saved.
 
 Author
-- Created by repository owner.
+- Created by Thomas Rasmussen
