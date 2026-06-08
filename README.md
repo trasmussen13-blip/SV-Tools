@@ -1,4 +1,4 @@
-# SV-Tools — AXM Service Admin User Utility
+# SV-Tools
 
 Small Windows tooling
 
