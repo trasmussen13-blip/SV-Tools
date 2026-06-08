@@ -25,6 +25,7 @@ param(
     [switch]$SQL,
     [switch]$MainDB,
     [switch]$Repository,
+    [switch]$Log,
     [switch]$All,
     [switch]$Dump,
     [string]$OutFile = "$env:COMPUTERNAME - AXM-info.txt"
@@ -62,6 +63,42 @@ function Get-ServiceListeningPorts {
     return $null
 }
 
+function Get-ServiceDependencyTree {
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory=$true)] [string]$ServiceName
+    )
+
+    $visited = @{}
+
+    function BuildTree {
+        param([string]$Name, [int]$Level)
+        if ($visited.ContainsKey($Name)) {
+            return (" " * ($Level*2)) + "- $Name (circular)"
+        }
+        $visited[$Name] = $true
+
+        $svc = Get-Service -Name $Name -ErrorAction SilentlyContinue
+        if (-not $svc) {
+            return (" " * ($Level*2)) + "- $Name (not found)"
+        }
+
+        $indent = " " * ($Level*2)
+        $line = "$indent- $($svc.Name) [$($svc.Status)]"
+
+        $deps = $svc.ServicesDependedOn
+        if ($deps) {
+            foreach ($d in $deps) {
+                $line += "`n" + (BuildTree -Name $d.Name -Level ($Level + 1))
+            }
+        }
+        return $line
+    }
+
+    return BuildTree -Name $ServiceName -Level 0
+}
+
+
 function Get-AXMServiceInfo {
     [OutputType([PSCustomObject])]
     param()
@@ -73,7 +110,25 @@ function Get-AXMServiceInfo {
             $_.Name -match $matchPattern -or $_.DisplayName -match $matchPattern
         } |
         Select-Object -Property Name, DisplayName, State, StartMode, Status, PathName, StartName,
-            @{Name='Ports';Expression={ Get-ServiceListeningPorts -ProcessId $_.ProcessId }}
+            @{Name='LastErrorCode';Expression={ $_.ExitCode }},
+            @{Name='Ports';Expression={ Get-ServiceListeningPorts -ProcessId $_.ProcessId }},
+            @{Name='Dependencies';Expression={
+                $svc = Get-Service -Name $_.Name -ErrorAction SilentlyContinue
+                if ($svc -and $svc.ServicesDependedOn) {
+                    ($svc.ServicesDependedOn | ForEach-Object { "$($_.Name) [$($_.Status)]" }) -join ', '
+                } else {
+                    $null
+                }
+            }},
+            @{Name='Dependents';Expression={
+                $svc = Get-Service -Name $_.Name -ErrorAction SilentlyContinue
+                if ($svc -and $svc.DependentServices) {
+                    ($svc.DependentServices | ForEach-Object { "$($_.Name) [$($_.Status)]" }) -join ', '
+                } else {
+                    $null
+                }
+            }},
+            @{Name='DependencyTree';Expression={ Get-ServiceDependencyTree -ServiceName $_.Name }}
 }
 
 function Get-AXMSoftwareInfo {
@@ -179,7 +234,7 @@ function Get-LockSysMgrRepositoryInfo {
         $repoSizeMB = if ($repoSizeBytes) { [math]::Round($repoSizeBytes / 1MB, 2) } else { 0 }
         $repoSizeText = "{0:N2} MB" -f $repoSizeMB
 
-        $subfolders = Get-ChildItem -Path $repo.FullName -Directory -Recurse -ErrorAction SilentlyContinue
+        $subfolders = Get-ChildItem -Path $repo.FullName -Directory -ErrorAction SilentlyContinue
         foreach ($subfolder in $subfolders) {
             $relativeName = $subfolder.FullName.Substring($repo.FullName.Length + 1)
             $subfolderSizeBytes = (Get-ChildItem -Path $subfolder.FullName -Recurse -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
@@ -210,6 +265,80 @@ function Get-LockSysMgrRepositoryInfo {
     }
 
     $results
+}
+
+function Get-LockSysMgrLogInfo {
+    [OutputType([PSCustomObject])]
+    param()
+
+    $logRoot = Join-Path $env:LOCALAPPDATA 'SimonsVoss\LockSysMgr\log'
+    if (-not (Test-Path $logRoot)) {
+        return @()
+    }
+
+    $logFile = Get-ChildItem -Path $logRoot -File -Filter 'AXM*' -ErrorAction SilentlyContinue |
+        Sort-Object -Property LastWriteTime -Descending |
+        Select-Object -First 1
+
+    if (-not $logFile) {
+        return @()
+    }
+
+    $lines = Get-Content -Path $logFile.FullName -ErrorAction SilentlyContinue
+    $licenseLine = $lines | Where-Object { $_ -match 'Query \{"\$type":"GetLicense"\} done; Response:' } | Select-Object -Last 1
+    if (-not $licenseLine) {
+        return [PSCustomObject]@{
+            LogFile       = $logFile.FullName
+            FoundLicense  = $false
+            Error         = 'No GetLicense response found in latest AXM log.'
+        }
+    }
+
+    $responseIndex = $licenseLine.IndexOf('Response:')
+    $jsonText = if ($responseIndex -ge 0) { $licenseLine.Substring($responseIndex + 9).Trim() } else { $null }
+    if (-not $jsonText) {
+        return [PSCustomObject]@{
+            LogFile       = $logFile.FullName
+            FoundLicense  = $true
+            Error         = 'Response JSON section could not be extracted.'
+        }
+    }
+
+    # Trim trailing non-JSON suffix such as XML-style log metadata
+    if ($jsonText -match '^(.*\})(?:\s*<s:.*)?$') {
+        $jsonText = $matches[1].Trim()
+    }
+
+    try {
+        $licenseData = $jsonText | ConvertFrom-Json -ErrorAction Stop
+        $registration = $licenseData.RegistrationDetails
+        $subscription = $licenseData.SubscriptionInfo
+        return [PSCustomObject]@{
+            LogFile                  = $logFile.FullName
+            FoundLicense             = $true
+            LicenseType              = $licenseData.Type
+            SoftwareEdition          = $licenseData.SoftwareEdition
+            StartDate                = $licenseData.StartDate
+            ExpirationDate           = $licenseData.ExpirationDate
+            CompanyName              = $registration.CompanyName
+            City                     = $registration.City
+            Country                  = $registration.Country
+            Email                    = $registration.Email
+            LicenseKey               = $registration.LicenseKey
+            CommissionNumber         = $registration.CommissionNumber
+            SubscriptionExpiryDate   = $subscription.ExpiryDate
+            PaymentApproved          = $subscription.PaymentApproved
+            AreOnlineFeaturesAllowed = $licenseData.AreOnlineFeaturesAllowed
+            IsDeactivated            = $licenseData.IsDeactivated
+        }
+    } catch {
+        return [PSCustomObject]@{
+            LogFile       = $logFile.FullName
+            FoundLicense  = $true
+            Error         = "Failed to parse license JSON: $($_.Exception.Message)"
+            RawResponse   = $jsonText
+        }
+    }
 }
 
 function Get-SQLServerInstanceInfo {
@@ -321,12 +450,12 @@ function Get-SQLInstanceInfo {
 }
 
 function Show-Usage {
-    Write-Host "Usage: .\Check-AXMInstances.ps1 [-Services] [-Software] [-SQL] [-MainDB] [-Repository] [-All]" -ForegroundColor Yellow
-    Write-Host "If no switch is provided, the script runs Services, Software, SQL, MainDB, and Repository checks." -ForegroundColor Yellow
+    Write-Host "Usage: .\Check-AXMInstances.ps1 [-Services] [-Software] [-SQL] [-MainDB] [-Repository] [-Log] [-All]" -ForegroundColor Yellow
+    Write-Host "If no switch is provided, the script runs Log, Software, Services, Repository, MainDB, and SQL checks." -ForegroundColor Yellow
 }
 
 # If no arguments were provided, offer an interactive prompt to select checks.
-$noArgs = -not ($Services -or $Software -or $SQL -or $MainDB -or $Repository -or $All)
+$noArgs = -not ($Services -or $Software -or $SQL -or $MainDB -or $Repository -or $Log -or $All)
 $dumpConfirmed = $false
 if ($noArgs) {
     try {
@@ -347,6 +476,9 @@ if ($noArgs) {
             $repoAns = Read-Host "Run Repository scan? (Y/N) [Y]"
             $Repository = -not ($repoAns -and $repoAns -match '^(?i:n|no)$')
 
+            $logAns = Read-Host "Run latest AXM log lookup? (Y/N) [Y]"
+            $Log = -not ($logAns -and $logAns -match '^(?i:n|no)$')
+
             $dumpAns = Read-Host "Save report to file? (Y/N) [N]"
             if ($dumpAns -and $dumpAns -match '^(?i:y|yes)$') {
                 $Dump = $true
@@ -360,6 +492,7 @@ if ($noArgs) {
             $SQL = $true
             $MainDB = $true
             $Repository = $true
+            $Log = $true
         }
     } catch {
         # Non-interactive host (Read-Host unavailable) — fall back to previous behavior
@@ -368,6 +501,7 @@ if ($noArgs) {
         $SQL = $true
         $MainDB = $true
         $Repository = $true
+        $Log = $true
     }
 }
 
@@ -377,6 +511,7 @@ if ($All) {
     $SQL = $true
     $MainDB = $true
     $Repository = $true
+    $Log = $true
 }
 
 # Handle optional dumping of script output to a file using Start-Transcript
@@ -436,23 +571,23 @@ if ($Dump) {
     }
 }
 
-if (-not ($Services) -and -not ($Software) -and -not ($SQL) -and -not ($MainDB) -and -not ($Repository)) {
+if (-not ($Services) -and -not ($Software) -and -not ($SQL) -and -not ($MainDB) -and -not ($Repository) -and -not ($Log)) {
     Show-Usage
     exit 1
 }
 
-if ($Services) {
-    Write-Host "\nScanning for AXM services..." -ForegroundColor Cyan
-    $serviceResults = Get-AXMServiceInfo
-    if ($serviceResults) {
-        $serviceResults | Format-Table -AutoSize
+if ($Log) {
+    Write-Host "\nAXM log lookup from AppData\Local\SimonsVoss\LockSysMgr\log..." -ForegroundColor Cyan
+    $logResults = Get-LockSysMgrLogInfo
+    if ($logResults) {
+        $logResults | Format-List
     } else {
-        Write-Host "No AXM services found." -ForegroundColor Yellow
+        Write-Host "No AXM log information found." -ForegroundColor Yellow
     }
 }
 
 if ($Software) {
-    Write-Host "\nScanning for installed AXM software..." -ForegroundColor Cyan
+    Write-Host "\nInstalled AXM software..." -ForegroundColor Cyan
     $softwareResults = Get-AXMSoftwareInfo
     if ($softwareResults) {
         $softwareResults | Select-Object DisplayName, DisplayVersion, Publisher, InstallLocation | Format-Table -AutoSize
@@ -461,18 +596,18 @@ if ($Software) {
     }
 }
 
-if ($MainDB) {
-    Write-Host "\nScanning for main_* configuration under ProgramData\SimonsVoss\LockSysMgr\config..." -ForegroundColor Cyan
-    $mainResults = Get-LockSysMgrMainInfo
-    if ($mainResults) {
-        $mainResults | Format-Table -AutoSize
+if ($Services) {
+    Write-Host "\nAXM services..." -ForegroundColor Cyan
+    $serviceResults = Get-AXMServiceInfo
+    if ($serviceResults) {
+        $serviceResults | Format-Table -AutoSize
     } else {
-        Write-Host "No LockSysMgr config directory found." -ForegroundColor Yellow
+        Write-Host "No AXM services found." -ForegroundColor Yellow
     }
 }
 
 if ($Repository) {
-    Write-Host "\nScanning for repository subfolders under ProgramData\SimonsVoss\Repository-*..." -ForegroundColor Cyan
+    Write-Host "\nRepository scan under ProgramData\SimonsVoss..." -ForegroundColor Cyan
     $repoResults = Get-LockSysMgrRepositoryInfo
     if ($repoResults) {
         $repoResults | Select-Object Repository, RepositorySize, SubfolderName, SubfolderSize, Status | Format-Table -AutoSize
@@ -482,7 +617,7 @@ if ($Repository) {
 }
 
 if ($SQL) {
-    Write-Host "\nScanning for installed SQL Server instances..." -ForegroundColor Cyan
+    Write-Host "\nDatabase instances..." -ForegroundColor Cyan
     $sqlResults = Get-SQLInstanceInfo
     if ($sqlResults) {
         $sqlResults | Select-Object InstanceName, InstanceType, Edition, Version, ServiceName, ServiceStatus | Format-Table -AutoSize

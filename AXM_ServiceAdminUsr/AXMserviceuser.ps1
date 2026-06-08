@@ -4,8 +4,8 @@
 
 .DESCRIPTION
     Creates a local service account named svcaxm_usr and configures it to run all
-    services matching the "axm*" wildcard. Generates a random password and saves
-    it to a file named [hostname]-password.txt in the script folder.
+    services matching the "axm*" wildcard. Generates a random password and uses
+    it for service account configuration.
 
 .AUTHOR
     Thomas Krogager Rasmusen
@@ -62,24 +62,50 @@ function Get-CimErrorDescription {
     return $errorMap[$ReturnCode] -or "Unknown error code $ReturnCode"
 }
 
+function Validate-AXMServices {
+    param(
+        [Parameter(Mandatory=$true)] [array]$Services,
+        [Parameter(Mandatory=$true)] [string]$ExpectedAccount
+    )
+
+    $validatedCount = 0
+    foreach ($service in $Services) {
+        $svc = Get-CimInstance -ClassName Win32_Service -Filter "Name='$($service.Name)'" -ErrorAction SilentlyContinue
+        if (-not $svc) {
+            Write-Host "Validation: Service '$($service.Name)' not found." -ForegroundColor Red
+            continue
+        }
+
+        $expectedAccounts = @(
+            ".\$ExpectedAccount",
+            "$env:COMPUTERNAME\$ExpectedAccount",
+            $ExpectedAccount
+        )
+        $accountMatches = $expectedAccounts -contains $svc.StartName
+        $statusOk = $svc.State -eq 'Running'
+
+        if ($statusOk -and $accountMatches) {
+            $color = 'Green'
+            $validatedCount++
+        } elseif ($statusOk) {
+            $color = 'Yellow'
+        } else {
+            $color = 'Red'
+        }
+
+        Write-Host "Validation: $($svc.Name) => State=$($svc.State), StartName=$($svc.StartName)" -ForegroundColor $color
+    }
+
+    Write-Host "`nValidated $validatedCount of $($Services.Count) configured services." -ForegroundColor Cyan
+    return $validatedCount -eq $Services.Count
+}
+
 # Generate random password
 $passwordLength = 32
 # Use only safe characters that won't cause parsing issues in service configuration
 $characters = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
 $password = -join ((1..$passwordLength) | ForEach-Object { Get-Random -InputObject $characters.ToCharArray() })
 $pw = ConvertTo-SecureString $password -AsPlainText -Force
-
-# Save password to file with hostname
-$hostname = $env:COMPUTERNAME
-$scriptPath = Split-Path -Parent $MyInvocation.MyCommand.Path
-$passwordFile = Join-Path $scriptPath "${hostname}-password.txt"
-try {
-    $password | Out-File -FilePath $passwordFile -Encoding UTF8 -Force
-    Write-Host "Password saved to: $passwordFile" -ForegroundColor Green
-} catch {
-    Write-Host "Error saving password file: $_" -ForegroundColor Red
-    exit 1
-}
 
 # Get or create the service user
 $localUserExists = $false
@@ -148,19 +174,38 @@ try {
     Write-Host "Warning: Could not grant 'Log On As A Service' privilege: $_" -ForegroundColor Yellow
 }
 
-# Seat the user across all AXM services
-Write-Host "`nSeating user '$accountName' to all AXM services..." -ForegroundColor Cyan
+# Seat the user across all AXM services plus additional AXM-related services
+Write-Host "`nSeating user '$accountName' to AXM, VNHOST, and COMNODE services..." -ForegroundColor Cyan
 
-# Find all services matching axm* wildcard
+# Define services to configure
+$servicePatterns = @("axm*", "vnhost*", "comnode*", "CommNodeSrv", "VnHostSrv")
 $axmServices = @()
-try {
-    $axmServices = @(Get-Service -Name "axm*" -ErrorAction SilentlyContinue)
-} catch {
-    $axmServices = @()
+foreach ($pattern in $servicePatterns) {
+    try {
+        $axmServices += @(Get-Service -Name $pattern -ErrorAction SilentlyContinue)
+    } catch {
+        # Ignore pattern errors and continue collecting other services
+    }
 }
 
+# Fallback: search by display name if service names do not match exactly
+$displayNamePatterns = @("VnHostSrv", "CommNodeSrv")
+foreach ($pattern in $displayNamePatterns) {
+    try {
+        $axmServices += @(Get-Service | Where-Object { $_.DisplayName -like "*$pattern*" -or $_.Name -like "*$pattern*" })
+    } catch {
+        # Ignore display name search errors
+    }
+}
+
+# Deduplicate service list by name
+$axmServices = $axmServices | Sort-Object -Property Name -Unique
+
+$foundNames = $axmServices | Select-Object -ExpandProperty Name
+Write-Host "Found services to configure: $($foundNames -join ', ')" -ForegroundColor Cyan
+
 if ($axmServices.Count -eq 0) {
-    Write-Host "No AXM services found matching pattern 'axm*'." -ForegroundColor Yellow
+    Write-Host "No services found matching patterns: $($servicePatterns -join ', ') or display names: $($displayNamePatterns -join ', ')" -ForegroundColor Yellow
 } else {
     # Stop all services first (including dependent services)
     Write-Host "`nStopping all AXM services and their dependents before reconfiguration..." -ForegroundColor Yellow
@@ -170,7 +215,9 @@ if ($axmServices.Count -eq 0) {
     foreach ($service in $axmServices) {
         $servicesToStop += $service
         # Get dependent services
-        $dependents = Get-Service | Where-Object { $_.DependentServices -contains $service }
+        $dependents = Get-Service | Where-Object {
+            $_.DependentServices | Where-Object { $_.Name -eq $service.Name }
+        }
         if ($dependents) {
             $servicesToStop += $dependents
         }
@@ -243,50 +290,6 @@ if ($axmServices.Count -eq 0) {
                 }
             }
             
-            # Grant permissions to service binary directory
-            if ($serviceDetails -and $serviceDetails.PathName) {
-                try {
-                    $binaryPath = $serviceDetails.PathName -replace '^"([^"]+)".*', '$1' # Extract path from quotes
-                    $binaryDir = Split-Path -Parent $binaryPath
-                    
-                    if (Test-Path $binaryDir) {
-                        # Grant Modify permissions to the service account
-                        $acl = Get-Acl $binaryDir
-                        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
-                            ".\$accountName",
-                            "Modify",
-                            "ContainerInherit,ObjectInherit",
-                            "None",
-                            "Allow"
-                        )
-                        $acl.SetAccessRule($rule)
-                        Set-Acl -Path $binaryDir -AclObject $acl
-                        Write-Host "Granted permissions on: $binaryDir" -ForegroundColor Green
-                    }
-                } catch {
-                    Write-Host "Warning: Could not set folder permissions: $_" -ForegroundColor Yellow
-                }
-            }
-            
-            # Grant service registry key permissions
-            try {
-                $regPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$serviceName"
-                if (Test-Path $regPath) {
-                    $acl = Get-Acl $regPath
-                    $rule = New-Object System.Security.AccessControl.RegistryAccessRule(
-                        ".\$accountName",
-                        "FullControl",
-                        "ContainerInherit,ObjectInherit",
-                        "None",
-                        "Allow"
-                    )
-                    $acl.SetAccessRule($rule)
-                    Set-Acl -Path $regPath -AclObject $acl
-                    Write-Host "Granted registry permissions for: $serviceName" -ForegroundColor Green
-                }
-            } catch {
-                Write-Host "Warning: Could not set registry permissions: $_" -ForegroundColor Yellow
-            }
             
             $successCount++
             
@@ -308,7 +311,7 @@ if ($axmServices.Count -eq 0) {
 
 # Restart all configured AXM services and their dependents
 if ($axmServices.Count -gt 0) {
-    Write-Host "`nStarting all configured AXM services..." -ForegroundColor Cyan
+    Write-Host "`nStarting all configured services in dependency order..." -ForegroundColor Cyan
     
     # Add a longer delay before starting services to allow system to settle and permissions to take effect
     Write-Host "Waiting for system to stabilize (15 seconds)..." -ForegroundColor Yellow
@@ -316,26 +319,24 @@ if ($axmServices.Count -gt 0) {
     
     $restartCount = 0
     
-    # Create a function to recursively start services and their dependencies
+    # Create a function to recursively start a service and its dependencies
     function Start-ServiceWithDependencies {
         param(
             [string]$ServiceName,
             [hashtable]$StartedServices
         )
         
-        # Skip if already started
         if ($StartedServices.ContainsKey($ServiceName)) {
             return
         }
         
-        # Get the service
         $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
         if (-not $svc) {
             Write-Host "Service $ServiceName not found." -ForegroundColor Red
+            $StartedServices[$ServiceName] = $false
             return
         }
         
-        # Start service dependencies first
         foreach ($dep in $svc.ServicesDependedOn) {
             if (-not $StartedServices.ContainsKey($dep.Name)) {
                 Start-ServiceWithDependencies -ServiceName $dep.Name -StartedServices $StartedServices
@@ -343,13 +344,11 @@ if ($axmServices.Count -gt 0) {
             }
         }
         
-        # Now start the service itself
         try {
             if ($svc.Status -ne 'Running') {
                 Write-Host "Attempting to start: $ServiceName" -ForegroundColor Yellow
                 Start-Service -Name $ServiceName -ErrorAction Stop
                 
-                # Wait a bit and verify it's actually running
                 Start-Sleep -Seconds 2
                 $svcStatus = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
                 
@@ -359,14 +358,6 @@ if ($axmServices.Count -gt 0) {
                 } else {
                     Write-Host "Service $ServiceName started but not running. Status: $($svcStatus.Status)" -ForegroundColor Red
                     $StartedServices[$ServiceName] = $false
-                    
-                    # Check Event Viewer for errors
-                    try {
-                        $lastError = Get-WinEvent -LogName System -FilterXPath "*[System[EventID=7000 or EventID=7001 or EventID=7024 or EventID=7032 or EventID=7034 or EventID=7039 or EventID=7045] and System[Provider[@Name='Service Control Manager']]]" -MaxEvents 1 -ErrorAction SilentlyContinue
-                        if ($lastError) {
-                            Write-Host "Event Log: $($lastError.Message)" -ForegroundColor Red
-                        }
-                    } catch {}
                 }
             } else {
                 Write-Host "Service already running: $ServiceName" -ForegroundColor Cyan
@@ -375,29 +366,27 @@ if ($axmServices.Count -gt 0) {
         } catch {
             Write-Host "Error starting service $ServiceName : $_" -ForegroundColor Red
             $StartedServices[$ServiceName] = $false
-            
-            # Try to get more info from Event Viewer
-            try {
-                $lastError = Get-WinEvent -LogName System -FilterXPath "*[System[EventID=7000 or EventID=7001 or EventID=7024 or EventID=7032 or EventID=7034 or EventID=7039 or EventID=7045] and System[Provider[@Name='Service Control Manager']]]" -MaxEvents 1 -ErrorAction SilentlyContinue
-                if ($lastError) {
-                    Write-Host "Event Log: $($lastError.Message)" -ForegroundColor Red
-                }
-            } catch {}
         }
     }
     
     $startedServices = @{}
-    
-    # Start all AXM services in dependency order
-    foreach ($service in $axmServices) {
+    $servicesToRestart = $servicesToStop | Sort-Object -Property Name -Unique
+
+    foreach ($service in $servicesToRestart) {
         Start-ServiceWithDependencies -ServiceName $service.Name -StartedServices $startedServices
         Start-Sleep -Seconds 5
     }
     
-    # Count successful starts
     $restartCount = ($startedServices.Values | Where-Object { $_ -eq $true }).Count
-    
-    Write-Host "`nSuccessfully started $restartCount of $($axmServices.Count) AXM services." -ForegroundColor Cyan
+    Write-Host "`nSuccessfully started $restartCount of $($servicesToRestart.Count) touched services." -ForegroundColor Cyan
+
+    Write-Host "`nValidating configured AXM services..." -ForegroundColor Cyan
+    $validationSuccess = Validate-AXMServices -Services $axmServices -ExpectedAccount $accountName
+    if (-not $validationSuccess) {
+        Write-Host "One or more AXM services did not validate successfully. Review the service state and StartName above." -ForegroundColor Yellow
+    } else {
+        Write-Host "All configured services validated successfully." -ForegroundColor Green
+    }
 }
 
 Write-Host "`nService user seating complete!" -ForegroundColor Green
