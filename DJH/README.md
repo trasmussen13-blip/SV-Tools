@@ -1,138 +1,98 @@
+The user wants an updated README.md that covers all the scripts we've built, without emojis or fancy formatting, just clean Git-ready markdown.
+```markdown # CSV Filter & Delta Compare Tool
 
-```markdown
-# CSV Filter Tool
+Delivered AS IS by SimonsVoss. This is not a standard product and is therefore not covered by normal support terms. SimonsVoss takes no responsibility for any issues, data loss, or other consequences that may arise from the use of this tool. Use at your own risk.
+Requirements
 
-A simple tool that filters a CSV file based on specific values in the `UserGroupText` 
-column, and replaces all `.` with `:` in the remaining data.
+    Windows OS
+    PowerShell 5.0 or higher
+    Input files must be placed in the same folder as the scripts
 
----
+File Structure
 
-## ⚠️ Disclaimer
-
-> **This project is delivered AS IS by SimonsVoss.**
-> 
-> This is not a standard product and is therefore **not covered by normal support terms.**
-> SimonsVoss takes no responsibility for any issues, data loss, or other consequences
-> that may arise from the use of this tool. Use at your own risk.
-
----
-
-## 📋 Requirements
-
-- Windows OS
-- PowerShell 5.0 or higher
-- The `Users_export.csv` file must be in the same folder as the scripts
-
----
-
-## 📁 File Structure
-
-```
-📁 Your Folder
+Your Folder
  ├── run.bat
- ├── filter_csv.ps1
- └── Users_export.csv
-```
+ ├── master_filter.ps1
+ ├── Users_export.csv
+ └── LSM_export.csv
 
----
+How To Use
 
-## 🚀 How To Use
+    Place all files in the same folder
+    Double-click run.bat to run the tool
+    Output files will be saved in the same folder
 
-1. Place all files in the **same folder**
-2. Double-click **`run.bat`** to run the tool
-3. The filtered file will be saved as **`Users_export_filtered.csv`** in the same folder
+Note: Always run the tool via run.bat - never run the .ps1 file directly.
+Workflow
 
----
+The tool runs three steps in sequence.
+Step 1 - Filter Users_export.csv
 
-## ⚙️ What It Does
+Reads Users_export.csv and removes all rows where the UserGroupText column does not contain one of the following values:
 
-### Filtering
-Scans `Users_export.csv` and **removes all rows** that do not have one of the 
-following values in the `UserGroupText` column:
+Elever m/sk:hjem
+Elever
 
-| Kept Values        |
-|--------------------|
-| `Elever m/sk:hjem` |
-| `Elever`           |
+All . (dots) are replaced with : (colons) across all columns in the remaining rows.
 
-### Text Replacement
-Replaces **all** `.` (dots) with `:` (colons) across **all columns** in the 
-remaining rows.
+Output: Users_export_filtered.csv
+Step 2 - Filter LSM_export.csv
 
-### Output
-Saves the filtered and modified data to a new file:
-```
-Users_export_filtered.csv
-```
-The original `Users_export.csv` file is **not modified**.
+Reads LSM_export.csv and removes all rows where the TransponderGroup.Name column does not contain one of the following values:
 
----
+Elever m/sk:hjem
+Elever
 
-## 📊 Output Example
+No dot replacement is performed on LSM data as it is considered valid as-is.
 
-When the script runs, it will display statistics like this:
+Output: Used internally for Step 3 only - not saved to disk.
+Step 3 - Delta Comparison
 
-```
-----------------------------------------
-Original antal rækker:  1500
-Beholdte rækker:        342
-Slettede rækker:        1158
-Alle '.' er erstattet med ':'
-----------------------------------------
-Filtreret fil gemt som: Users_export_filtered.csv
-```
+Compares Person.PersonalNumber from the filtered LSM data against UserId from Users_export_filtered.csv.
 
----
+Returns only rows from LSM where Person.PersonalNumber does not exist as a UserId in the filtered Users data.
 
-## 🔧 Configuration
+Output: delta_export.csv
+Output Files
 
-### Change Delimiter
-If your CSV uses `,` instead of `;`, open `filter_csv.ps1` and change:
-```powershell
+Your Folder
+ ├── Users_export_filtered.csv         <- Step 1 output
+ ├── delta_export.csv                  <- Step 3 output
+ └── filter_log_yyyy-MM-dd_HH-mm-ss.txt <- Log file per run
+
+Logging
+
+Each run generates a new log file with a timestamp in the filename. The log contains timestamped entries for all steps including row counts and file paths.
+
+Example log entry:
+
+[2024-01-15 08:30:01] Original antal rækker:  1500
+[2024-01-15 08:30:01] Beholdte rækker:        342
+[2024-01-15 08:30:01] Slettede rækker:        1158
+
+Previous logs are never overwritten.
+Configuration
+Change Delimiter
+
+If your CSV uses , instead of ;, open master_filter.ps1 and change:
+
 Import-Csv -Path $inputFile -Delimiter ";"
 # To:
 Import-Csv -Path $inputFile -Delimiter ","
-```
 
-### Change Allowed Values
-To add or remove allowed values in `UserGroupText`, open `filter_csv.ps1` and edit:
-```powershell
+Change Allowed Filter Values
+
+To add or remove allowed values, open master_filter.ps1 and edit:
+
 $allowedValues = @("Elever m/sk:hjem", "Elever")
-```
 
-### Replace in Specific Column Only
-To only replace `.` with `:` in a specific column, open `filter_csv.ps1` and 
-replace the replacement block with:
-```powershell
-$row.UserGroupText = $row.UserGroupText -replace '\.', ':'
-```
+Troubleshooting
+Problem	Solution
+Script won't run	Run via run.bat - never run the .ps1 file directly
+File not found error	Make sure input CSV files are in the same folder as the scripts
+Wrong delimiter error	Check if your CSV uses ; or , and update master_filter.ps1
+Output file is empty	Verify that column names in the CSV match exactly what the script expects
+Encoding issues	Make sure input CSV files are saved as UTF-8
+License
 
-### Overwrite Original File
-To overwrite the original file instead of creating a new one, open `filter_csv.ps1` 
-and change:
-```powershell
-$outputFile = "Users_export_filtered.csv"
-# To:
-$outputFile = "Users_export.csv"
-```
-
----
-
-## ❗ Troubleshooting
-
-| Problem | Solution |
-|--------|----------|
-| Script won't run | Make sure all files are in the same folder |
-| "File not found" error | Make sure `Users_export.csv` is in the same folder |
-| Wrong delimiter error | Check if your CSV uses `;` or `,` and update `filter_csv.ps1` |
-| Output file is empty | Check that `UserGroupText` column name matches exactly in your CSV |
-| Encoding issues | Make sure the CSV is saved as `UTF-8` |
-
----
-
-## 📄 License
-
-&copy; SimonsVoss. This project is delivered **AS IS** and is not a standard product.
-It is not covered by normal SimonsVoss support terms. No warranties or guarantees 
-of any kind are provided.
-```
+Copyright SimonsVoss. This project is delivered AS IS and is not a standard product. It is not covered by normal SimonsVoss support terms. No warranties or guarantees of any kind are provided.
