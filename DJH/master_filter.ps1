@@ -33,6 +33,14 @@ $delimiter       = ";"
 # Character encoding used when reading and writing all CSV files
 $encoding        = "UTF8"
 
+# Column name for firstname in Users_export.csv
+$colFirstName    = "Firstname"
+
+# Column name for surname/lastname in Users_export.csv
+# If this column is empty the firstname value will be moved to this column
+# This handles vendors who may only have a single name registered
+$colLastName     = "Surname"
+
 #
 #  ██████╗  ██████╗     ███╗   ██╗ ██████╗ ████████╗    ███████╗██████╗ ██╗████████╗
 #  ██╔══██╗██╔═══██╗    ████╗  ██║██╔═══██╗╚══██╔══╝    ██╔════╝██╔══██╗██║╚══██╔══╝
@@ -95,6 +103,8 @@ Write-Log "  Log fil:          $logFile"
 Write-Log "  Delimiter:        $delimiter"
 Write-Log "  Encoding:         $encoding"
 Write-Log "  Blast radius:     $blastRadiusPct%"
+Write-Log "  Firstname kolonne: $colFirstName"
+Write-Log "  Lastname kolonne:  $colLastName"
 Write-Log "  Tilladte værdier: $($allowedValues -join ', ')"
 
 # ----------------------------------------
@@ -113,6 +123,19 @@ if (-not (Test-Path $usersInputFile)) {
 $usersData = Import-Csv -Path $usersInputFile -Delimiter $delimiter -Encoding $encoding
 
 $usersFiltered = $usersData | Where-Object { $allowedValues -contains $_.UserGroupText }
+
+# Flyt firstname til lastname hvis lastname er tom (fx leverandører)
+$nameFixCount = 0
+$usersFiltered = $usersFiltered | ForEach-Object {
+    if ([string]::IsNullOrWhiteSpace($_.$colLastName) -and -not [string]::IsNullOrWhiteSpace($_.$colFirstName)) {
+        $_.$colLastName  = $_.$colFirstName
+        $_.$colFirstName = ""
+        $nameFixCount++
+    }
+    $_
+}
+
+Write-Log "Rækker hvor firstname flyttet til lastname: $nameFixCount"
 
 # Erstat alle "." med ":" i alle felter
 $usersModified = $usersFiltered | ForEach-Object {
