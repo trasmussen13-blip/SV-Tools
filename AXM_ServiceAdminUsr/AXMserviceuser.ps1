@@ -222,19 +222,6 @@ $characters = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
 $password = -join ((1..$passwordLength) | ForEach-Object { Get-Random -InputObject $characters.ToCharArray() })
 $pw = ConvertTo-SecureString $password -AsPlainText -Force
 
-# Save password to file next to script
-$hostname = $env:COMPUTERNAME
-$scriptPath = Split-Path -Parent $MyInvocation.MyCommand.Path
-if (-not $scriptPath) { $scriptPath = (Get-Location).Path }
-$passwordFile = Join-Path $scriptPath "${hostname}-password.txt"
-try {
-    $password | Out-File -FilePath $passwordFile -Encoding UTF8 -Force
-    Write-Host "Password saved to: $passwordFile" -ForegroundColor Green
-} catch {
-    Write-Host "Error saving password file: $_" -ForegroundColor Red
-    throw
-}
-
 # Create or reset local service user
 try {
     $localUser = Get-LocalUser -Name $accountName -ErrorAction Stop
