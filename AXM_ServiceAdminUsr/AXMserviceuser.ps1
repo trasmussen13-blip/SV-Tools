@@ -4,21 +4,24 @@
 
 .DESCRIPTION
     Creates a local service account named svcaxm_usr and configures it to run all
-    services matching the "axm*" wildcard. Generates a random password and uses
-    it for service account configuration.
+    services matching the "axm*" wildcard. Generates a random password and saves
+    it to a file named [hostname]-password.txt in the script folder.
+
+    Uses CIM first to set service credentials and falls back to sc.exe if needed.
+    Stops services before reconfiguration, restarts them afterwards, and validates
+    the final result.
 
 .AUTHOR
     Thomas Krogager Rasmusen
     SimonsVoss
 
 .VERSION
-    1.0.5
+    1.0.6
 
 .NOTES
     Requires administrator privileges to execute.
 #>
 
-# Requires administrator privileges
 #Requires -RunAsAdministrator
 
 $accountName = "svcaxm_usr"
@@ -27,21 +30,20 @@ $description = "Service account for AXM services"
 
 Write-Host "Starting AXM service user setup..." -ForegroundColor Cyan
 
-# Function to map WMI error codes to descriptions
 function Get-CimErrorDescription {
     param([int]$ReturnCode)
-    
+
     $errorMap = @{
-        0 = 'Success'
-        1 = 'Not Supported'
-        2 = 'Access Denied'
-        3 = 'Dependent Services Running'
-        4 = 'Invalid Service Control'
-        5 = 'Service Cannot Accept Control'
-        6 = 'Service Not Active'
-        7 = 'Service Request Timeout'
-        8 = 'Unknown Failure'
-        9 = 'Path Not Found'
+        0  = 'Success'
+        1  = 'Not Supported'
+        2  = 'Access Denied'
+        3  = 'Dependent Services Running'
+        4  = 'Invalid Service Control'
+        5  = 'Service Cannot Accept Control'
+        6  = 'Service Not Active'
+        7  = 'Service Request Timeout'
+        8  = 'Unknown Failure'
+        9  = 'Path Not Found'
         10 = 'Service Already Running'
         11 = 'Service Database Locked'
         12 = 'Service Dependency Deleted'
@@ -58,17 +60,81 @@ function Get-CimErrorDescription {
         23 = 'Status Service Exists'
         24 = 'Status Shutdown in Progress'
     }
-    
+
     return $errorMap[$ReturnCode] -or "Unknown error code $ReturnCode"
+}
+
+# PowerShell
+function Set-ServiceAccount {
+    param(
+        [Parameter(Mandatory = $true)][string]$ServiceName,
+        [Parameter(Mandatory = $true)][string]$AccountName,
+        [Parameter(Mandatory = $true)][string]$Password
+    )
+
+    # Prøv begge konto-formater i denne rækkefølge: lokal form først, så maskin\brugernavn
+    $attempts = @(".\$AccountName", "$env:COMPUTERNAME\$AccountName")
+
+    foreach ($serviceAccount in $attempts) {
+        Write-Host "Prøver CIM Change med StartName='$serviceAccount' for service '$ServiceName'" -ForegroundColor Cyan
+
+        try {
+            $svc = Get-CimInstance -ClassName Win32_Service -Filter "Name='$ServiceName'" -ErrorAction Stop
+            $changeResult = Invoke-CimMethod -InputObject $svc -MethodName Change -Arguments @{
+                StartName     = $serviceAccount
+                StartPassword = $Password
+            } -ErrorAction Stop
+
+            if ($changeResult -ne $null) {
+                Write-Host "CIM: Change() ReturnValue = $($changeResult.ReturnValue) ($(Get-CimErrorDescription $changeResult.ReturnValue))" -ForegroundColor Yellow
+            }
+
+        } catch {
+            Write-Host "CIM: Invoke-CimMethod-fejl for $ServiceName med $serviceAccount : $_" -ForegroundColor Yellow
+        }
+
+        # Re-query
+        $svcRef = Get-CimInstance -ClassName Win32_Service -Filter "Name='$ServiceName'" -ErrorAction SilentlyContinue
+        if ($svcRef -and $svcRef.StartName -ieq $serviceAccount) {
+            Write-Host "Bekræftet StartName='$($svcRef.StartName)'" -ForegroundColor Green
+            return $true
+        } else {
+            Write-Host "CIM satte ikke StartName til '$serviceAccount' (er: '$($svcRef.StartName)')" -ForegroundColor Yellow
+        }
+    }
+
+    # CIM lykkedes ikke til at bekræfte konto/pass; fallback til sc.exe (samme ordre)
+    foreach ($serviceAccount in $attempts) {
+        Write-Host "Prøver sc.exe config med obj= $serviceAccount for $ServiceName" -ForegroundColor Cyan
+        $scArgs = @('config', $ServiceName, "obj= $serviceAccount", "password= $Password")
+        $scOutput = & sc.exe @scArgs 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "sc.exe returnerede success for $serviceAccount" -ForegroundColor Green
+        } else {
+            Write-Host "sc.exe fejlede for $serviceAccount : $scOutput" -ForegroundColor Red
+        }
+
+        $svcRef2 = Get-CimInstance -ClassName Win32_Service -Filter "Name='$ServiceName'" -ErrorAction SilentlyContinue
+        if ($svcRef2 -and $svcRef2.StartName -ieq $serviceAccount) {
+            Write-Host "Bekræftet via sc.exe at StartName = '$($svcRef2.StartName)'" -ForegroundColor Green
+            return $true
+        } else {
+            Write-Host "sc.exe ændrede ikke StartName til '$serviceAccount' (er: '$($svcRef2.StartName)')" -ForegroundColor Yellow
+        }
+    }
+
+    Write-Host "Kunne ikke sætte konto for $ServiceName med hverken CIM eller sc.exe" -ForegroundColor Red
+    return $false
 }
 
 function Validate-AXMServices {
     param(
-        [Parameter(Mandatory=$true)] [array]$Services,
-        [Parameter(Mandatory=$true)] [string]$ExpectedAccount
+        [Parameter(Mandatory = $true)][array]$Services,
+        [Parameter(Mandatory = $true)][string]$ExpectedAccount
     )
 
     $validatedCount = 0
+
     foreach ($service in $Services) {
         $svc = Get-CimInstance -ClassName Win32_Service -Filter "Name='$($service.Name)'" -ErrorAction SilentlyContinue
         if (-not $svc) {
@@ -77,10 +143,11 @@ function Validate-AXMServices {
         }
 
         $expectedAccounts = @(
-            ".\$ExpectedAccount",
-            "$env:COMPUTERNAME\$ExpectedAccount",
+            "$env:COMPUTERNAME\$ExpectedAccount"
+            ".\$ExpectedAccount"
             $ExpectedAccount
         )
+
         $accountMatches = $expectedAccounts -contains $svc.StartName
         $statusOk = $svc.State -eq 'Running'
 
@@ -96,297 +163,322 @@ function Validate-AXMServices {
         Write-Host "Validation: $($svc.Name) => State=$($svc.State), StartName=$($svc.StartName)" -ForegroundColor $color
     }
 
-    Write-Host "`nValidated $validatedCount of $($Services.Count) configured services." -ForegroundColor Cyan
-    return $validatedCount -eq $Services.Count
+    Write-Host ""
+    Write-Host "Validated $validatedCount of $($Services.Count) configured services." -ForegroundColor Cyan
+    return ($validatedCount -eq $Services.Count)
+}
+
+function Start-ServiceWithDependencies {
+    param(
+        [Parameter(Mandatory = $true)][string]$ServiceName,
+        [Parameter(Mandatory = $true)][hashtable]$StartedServices
+    )
+
+    if ($StartedServices.ContainsKey($ServiceName)) {
+        return
+    }
+
+    $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+    if (-not $svc) {
+        Write-Host "Service $ServiceName not found." -ForegroundColor Red
+        $StartedServices[$ServiceName] = $false
+        return
+    }
+
+    foreach ($dep in $svc.ServicesDependedOn) {
+        if (-not $StartedServices.ContainsKey($dep.Name)) {
+            Start-ServiceWithDependencies -ServiceName $dep.Name -StartedServices $StartedServices
+            Start-Sleep -Seconds 2
+        }
+    }
+
+    try {
+        if ($svc.Status -ne 'Running') {
+            Write-Host "Attempting to start: $ServiceName" -ForegroundColor Yellow
+            Start-Service -Name $ServiceName -ErrorAction Stop
+            Start-Sleep -Seconds 2
+
+            $svcStatus = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+            if ($svcStatus -and $svcStatus.Status -eq 'Running') {
+                Write-Host "Started service: $ServiceName" -ForegroundColor Green
+                $StartedServices[$ServiceName] = $true
+            } else {
+                Write-Host "Service $ServiceName did not stay running. Status: $($svcStatus.Status)" -ForegroundColor Red
+                $StartedServices[$ServiceName] = $false
+            }
+        } else {
+            Write-Host "Service already running: $ServiceName" -ForegroundColor Cyan
+            $StartedServices[$ServiceName] = $true
+        }
+    } catch {
+        Write-Host "Error starting service $ServiceName : $_" -ForegroundColor Red
+        $StartedServices[$ServiceName] = $false
+    }
 }
 
 # Generate random password
 $passwordLength = 32
-# Use only safe characters that won't cause parsing issues in service configuration
 $characters = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
 $password = -join ((1..$passwordLength) | ForEach-Object { Get-Random -InputObject $characters.ToCharArray() })
 $pw = ConvertTo-SecureString $password -AsPlainText -Force
 
-# Get or create the service user
-$localUserExists = $false
+# Save password to file next to script
+$hostname = $env:COMPUTERNAME
+$scriptPath = Split-Path -Parent $MyInvocation.MyCommand.Path
+if (-not $scriptPath) { $scriptPath = (Get-Location).Path }
+$passwordFile = Join-Path $scriptPath "${hostname}-password.txt"
 try {
-    Get-LocalUser -Name $accountName -ErrorAction Stop | Out-Null
-    $localUserExists = $true
-    Write-Host "Service user '$accountName' already exists." -ForegroundColor Green
+    $password | Out-File -FilePath $passwordFile -Encoding UTF8 -Force
+    Write-Host "Password saved to: $passwordFile" -ForegroundColor Green
 } catch {
-    Write-Host "Creating new service user '$accountName'..." -ForegroundColor Yellow
+    Write-Host "Error saving password file: $_" -ForegroundColor Red
+    throw
+}
+
+# Create or reset local service user
+try {
+    $localUser = Get-LocalUser -Name $accountName -ErrorAction Stop
+    $localUserExists = $true
+    Write-Host "Local user '$accountName' exists. Resetting password..." -ForegroundColor Yellow
+} catch {
+    $localUserExists = $false
+    Write-Host "Local user '$accountName' does not exist. Creating..." -ForegroundColor Yellow
 }
 
 try {
     if ($localUserExists) {
         Set-LocalUser -Name $accountName -Password $pw -ErrorAction Stop
-        Write-Host "Password for existing user '$accountName' was reset." -ForegroundColor Green
+        Write-Host "Password reset for '$accountName'." -ForegroundColor Green
     } else {
         New-LocalUser -Name $accountName -Password $pw -FullName $fullName -Description $description -ErrorAction Stop
-        Write-Host "Service user created successfully." -ForegroundColor Green
+        Write-Host "User '$accountName' created." -ForegroundColor Green
     }
-    
-    # Set password to never expire
+
     Set-LocalUser -Name $accountName -PasswordNeverExpires $true -ErrorAction Stop
-    Write-Host "Set password to never expire." -ForegroundColor Green
-    
+    Write-Host "Set password to never expire for '$accountName'." -ForegroundColor Green
 } catch {
-    Write-Host "Error creating or updating service user: $_" -ForegroundColor Red
-    exit 1
+    Write-Host "Error creating/updating local user: $_" -ForegroundColor Red
+    throw
 }
 
-# Assign admin rights using localized Administrators group
+# Add user to Administrators (localized group by SID)
 try {
     $adminGroup = Get-LocalGroup | Where-Object { $_.SID.Value -eq 'S-1-5-32-544' }
-    if (-not $adminGroup) {
-        throw "Administrators group not found by SID."
-    }
+    if (-not $adminGroup) { throw "Administrators group not found by SID." }
     Add-LocalGroupMember -Group $adminGroup.Name -Member $accountName -ErrorAction Stop
     Write-Host "Added '$accountName' to '$($adminGroup.Name)' group." -ForegroundColor Green
 } catch {
-    Write-Host "User already in Administrators group or admin assignment issue: $_" -ForegroundColor Yellow
+    Write-Host "Add-LocalGroupMember warning: $_" -ForegroundColor Yellow
 }
-
-# Grant "Log On As A Service" right to the service account
-Write-Host "`nGranting 'Log On As A Service' privilege to '$accountName'..." -ForegroundColor Cyan
+# Grant "Log On As A Service" (SeServiceLogonRight) using secedit export/modify/import
+Write-Host "Granting 'Log On As A Service' right to '$accountName'..." -ForegroundColor Cyan
 try {
     $tempFile = [System.IO.Path]::GetTempFileName()
-    $accountSID = (Get-LocalUser -Name $accountName).SID.Value
-    
-    # Export current security policy
+    $accountSID = (Get-LocalUser -Name $accountName -ErrorAction Stop).SID.Value
+
     & secedit.exe /export /cfg $tempFile /quiet 2>&1 | Out-Null
-    
-    # Add the Log On As A Service privilege
-    $content = Get-Content $tempFile
-    if ($content -match 'SeServiceLogonRight') {
-        $content = $content -replace 'SeServiceLogonRight = (.*)', "SeServiceLogonRight = `$1,$accountSID"
-    } else {
-        $content += "`nSeServiceLogonRight = $accountSID"
+
+    $content = Get-Content -Path $tempFile -ErrorAction Stop
+
+    # Find index of SeServiceLogonRight line
+    $idx = -1
+    for ($i = 0; $i -lt $content.Count; $i++) {
+        if ($content[$i] -match '^\s*SeServiceLogonRight\s*=') {
+            $idx = $i
+            break
+        }
     }
-    $content | Set-Content $tempFile
-    
-    # Apply the updated security policy
+
+    if ($idx -ge 0) {
+        $line = $content[$idx]
+        $parts = $line -split '='
+        $existing = @()
+        if ($parts.Count -gt 1) {
+            $existing = ($parts[1] -split ',') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
+        }
+        if ($existing -notcontains $accountSID) {
+            $existing += $accountSID
+        }
+        $content[$idx] = 'SeServiceLogonRight = ' + ($existing -join ',')
+    } else {
+        $content += "SeServiceLogonRight = $accountSID"
+    }
+
+    $content | Set-Content -Path $tempFile -Force
+
     & secedit.exe /configure /db secedit.sdb /cfg $tempFile /quiet 2>&1 | Out-Null
-    
-    Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
+
+    Remove-Item -Path $tempFile -Force -ErrorAction SilentlyContinue
     Write-Host "Granted 'Log On As A Service' privilege." -ForegroundColor Green
 } catch {
     Write-Host "Warning: Could not grant 'Log On As A Service' privilege: $_" -ForegroundColor Yellow
 }
+Write-Host "`nSeating user '$accountName' to AXM services only (excluding VnHostSrv and CommNodeSrv)..." -ForegroundColor Cyan
 
-# Seat the user across all AXM services plus additional AXM-related services
-Write-Host "`nSeating user '$accountName' to AXM, VNHOST, and COMNODE services..." -ForegroundColor Cyan
+# Discover AXM services that WILL be configured
+$axmServices = @(Get-Service -Name "axm*" -ErrorAction SilentlyContinue) | Sort-Object -Property Name -Unique
 
-# Define services to configure
-$servicePatterns = @("axm*", "vnhost*", "comnode*", "CommNodeSrv", "VnHostSrv")
-$axmServices = @()
-foreach ($pattern in $servicePatterns) {
-    try {
-        $axmServices += @(Get-Service -Name $pattern -ErrorAction SilentlyContinue)
-    } catch {
-        # Ignore pattern errors and continue collecting other services
-    }
+# Services to exclude from account seating, but still include in stop/restart
+$excludeForSeating = @('VnHostSrv', 'CommNodeSrv')
+
+# Final list of services to configure
+$configTargets = $axmServices | Where-Object {
+    $_.Name -notin $excludeForSeating -and
+    $_.DisplayName -notin $excludeForSeating
 }
 
-# Fallback: search by display name if service names do not match exactly
-$displayNamePatterns = @("VnHostSrv", "CommNodeSrv")
-foreach ($pattern in $displayNamePatterns) {
-    try {
-        $axmServices += @(Get-Service | Where-Object { $_.DisplayName -like "*$pattern*" -or $_.Name -like "*$pattern*" })
-    } catch {
-        # Ignore display name search errors
-    }
-}
+Write-Host "Services to configure: $($configTargets.Name -join ', ')" -ForegroundColor Cyan
+Write-Host "Excluded from seating, but still handled for restart if present: $($excludeForSeating -join ', ')" -ForegroundColor Cyan
 
-# Deduplicate service list by name
-$axmServices = $axmServices | Sort-Object -Property Name -Unique
-
-$foundNames = $axmServices | Select-Object -ExpandProperty Name
-Write-Host "Found services to configure: $($foundNames -join ', ')" -ForegroundColor Cyan
-
-if ($axmServices.Count -eq 0) {
-    Write-Host "No services found matching patterns: $($servicePatterns -join ', ') or display names: $($displayNamePatterns -join ', ')" -ForegroundColor Yellow
+if ($configTargets.Count -eq 0) {
+    Write-Host "No AXM services found to configure." -ForegroundColor Yellow
 } else {
-    # Stop all services first (including dependent services)
-    Write-Host "`nStopping all AXM services and their dependents before reconfiguration..." -ForegroundColor Yellow
+    # Build list of services to stop/restart:
+    # - configured AXM services
+    # - their dependent services
+    # - excluded services (VnHostSrv / CommNodeSrv) if present
+    # - dependents of excluded services
     $servicesToStop = @()
-    
-    # Gather all services and their dependents
-    foreach ($service in $axmServices) {
-        $servicesToStop += $service
-        # Get dependent services
-        $dependents = Get-Service | Where-Object {
-            $_.DependentServices | Where-Object { $_.Name -eq $service.Name }
-        }
-        if ($dependents) {
-            $servicesToStop += $dependents
+
+    foreach ($s in $configTargets) {
+        $servicesToStop += $s
+        if ($s.DependentServices) {
+            $servicesToStop += $s.DependentServices
         }
     }
-    
-    # Remove duplicates
+
+    foreach ($name in $excludeForSeating) {
+        $svc = Get-Service -Name $name -ErrorAction SilentlyContinue
+        if ($svc) {
+            $servicesToStop += $svc
+            if ($svc.DependentServices) {
+                $servicesToStop += $svc.DependentServices
+            }
+        }
+    }
+
     $servicesToStop = $servicesToStop | Sort-Object -Property Name -Unique
-    
-    # Stop all services
-    foreach ($service in $servicesToStop) {
+
+    Write-Host "Services that will be stopped/restarted: $($servicesToStop.Name -join ', ')" -ForegroundColor Cyan
+
+    Write-Host "`nStopping all targeted services and dependents..." -ForegroundColor Yellow
+    foreach ($svc in $servicesToStop) {
         try {
-            if ($service.Status -eq 'Running') {
-                Stop-Service -Name $service.Name -Force -ErrorAction Stop
-                Write-Host "Stopped service: $($service.Name)" -ForegroundColor Yellow
-            }
-        } catch {
-            Write-Host "Warning: Could not stop service $($service.Name): $_" -ForegroundColor Yellow
-        }
-    }
-    
-    # Add a small delay to ensure services are stopped
-    Start-Sleep -Seconds 2
-    
-    # Seat the user to all AXM services only
-    $successCount = 0
-    foreach ($service in $axmServices) {
-        try {
-            $serviceName = $service.Name
-            $scUser = ".\$accountName"
-            
-            Write-Host "Configuring service account for: $serviceName" -ForegroundColor Yellow
-            Write-Host "Resolved service account: $scUser" -ForegroundColor Cyan
-            
-            # Get service details before configuration
-            $serviceDetails = Get-CimInstance -ClassName Win32_Service -Filter "Name='$serviceName'"
-            if ($serviceDetails) {
-                $binaryPath = $serviceDetails.PathName
-                Write-Host "Service binary: $binaryPath" -ForegroundColor Cyan
-            }
-            
-            # Try to set the service account with CIM/WMI first
-            Write-Host "Attempting service account change via CIM for: $serviceName" -ForegroundColor Yellow
-            $changeResult = $null
-            try {
-                $changeResult = $serviceDetails | Invoke-CimMethod -MethodName Change -Arguments @{ StartName = $scUser; StartPassword = $password }
-            } catch {
-                Write-Host "CIM service change threw an error: $_" -ForegroundColor Yellow
-            }
-            
-            if ($changeResult -and $changeResult.ReturnValue -eq 0) {
-                Write-Host "Successfully seated '$accountName' to service: $serviceName via CIM" -ForegroundColor Green
+            if ($svc.Status -eq 'Running') {
+                Stop-Service -Name $svc.Name -Force -ErrorAction Stop
+                Write-Host "Stopped: $($svc.Name)" -ForegroundColor Yellow
             } else {
-                if ($changeResult) {
-                    Write-Host "CIM seating failed with ReturnValue=$($changeResult.ReturnValue) for service: $serviceName" -ForegroundColor Yellow
-                }
-                Write-Host "Falling back to sc.exe configuration." -ForegroundColor Yellow
-                
-                $scArgs = @(
-                    'config',
-                    $serviceName,
-                    "obj= $scUser",
-                    "password= $password"
-                )
-                Write-Host "sc.exe args: $($scArgs -join ' | ')" -ForegroundColor Cyan
-                $scOutput = & sc.exe @scArgs 2>&1
-                if ($LASTEXITCODE -eq 0) {
-                    Write-Host "Successfully seated '$accountName' to service: $serviceName via sc.exe" -ForegroundColor Green
-                } else {
-                    throw "sc.exe seating failed: $scOutput"
-                }
+                Write-Host "Not running: $($svc.Name)" -ForegroundColor Cyan
             }
-            
-            
-            $successCount++
-            
-            # Add small delay between configurations
-            Start-Sleep -Seconds 1
-            
         } catch {
-            Write-Host "Error seating user to $($service.Name): $_" -ForegroundColor Red
+            Write-Host "Warning: Could not stop $($svc.Name): $_" -ForegroundColor Yellow
         }
     }
-    Write-Host "`nSuccessfully configured $successCount of $($axmServices.Count) services." -ForegroundColor Cyan
-    
-    # Wait longer before restarting to allow service account privileges to take effect
+
+    Start-Sleep -Seconds 2
+
+    # Seat the user to each AXM service only
+    $successCount = 0
+    foreach ($svc in $configTargets) {
+        Write-Host "`nConfiguring $($svc.Name) ..." -ForegroundColor Cyan
+        $ok = $false
+        try {
+            $ok = Set-ServiceAccount -ServiceName $svc.Name -AccountName $accountName -Password $password
+            if ($ok) {
+                Write-Host "Seated $($svc.Name) -> $accountName" -ForegroundColor Green
+                $successCount++
+            } else {
+                Write-Host "Failed to seat $($svc.Name)" -ForegroundColor Red
+            }
+        } catch {
+            Write-Host "Error seating $($svc.Name): $_" -ForegroundColor Red
+        }
+
+        # Optional: grant filesystem and registry permissions to service binary and HKLM key
+        try {
+            $svcDetails = Get-CimInstance -ClassName Win32_Service -Filter "Name='$($svc.Name)'" -ErrorAction SilentlyContinue
+            if ($svcDetails -and $svcDetails.PathName) {
+                $binaryPath = $svcDetails.PathName -replace '^"([^"]+)".*', '$1'
+                $binaryDir = Split-Path -Parent $binaryPath
+
+                if (Test-Path $binaryDir) {
+                    try {
+                        $acl = Get-Acl -Path $binaryDir
+                        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+                            "$env:COMPUTERNAME\$accountName",
+                            "Modify",
+                            "ContainerInherit, ObjectInherit",
+                            "None",
+                            "Allow"
+                        )
+                        $acl.SetAccessRule($rule)
+                        Set-Acl -Path $binaryDir -AclObject $acl
+                        Write-Host "Granted Modify on: $binaryDir" -ForegroundColor Green
+                    } catch {
+                        Write-Host ("Warning: Could not set filesystem ACL on {0}: {1}" -f $binaryDir, $_) -ForegroundColor Yellow
+                    }
+                }
+
+                $regPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$($svc.Name)"
+                if (Test-Path $regPath) {
+                    try {
+                        $regAcl = Get-Acl -Path $regPath
+                        $regRule = New-Object System.Security.AccessControl.RegistryAccessRule(
+                            "$env:COMPUTERNAME\$accountName",
+                            "FullControl",
+                            "ContainerInherit, ObjectInherit",
+                            "None",
+                            "Allow"
+                        )
+                        $regAcl.SetAccessRule($regRule)
+                        Set-Acl -Path $regPath -AclObject $regAcl
+                        Write-Host "Granted registry FullControl for: $($svc.Name)" -ForegroundColor Green
+                    } catch {
+                        Write-Host "Warning: Could not set registry ACL for $($svc.Name): $_" -ForegroundColor Yellow
+                    }
+                }
+            }
+        } catch {
+            Write-Host "Permission assignment warning for $($svc.Name): $_" -ForegroundColor Yellow
+        }
+
+        Start-Sleep -Seconds 1
+    }
+
+    Write-Host "`nConfigured $successCount of $($configTargets.Count) services." -ForegroundColor Cyan
     if ($successCount -gt 0) {
-        Write-Host "`nWaiting for service account configuration to settle..." -ForegroundColor Cyan
+        Write-Host "Waiting for service account configuration to settle..." -ForegroundColor Cyan
         Start-Sleep -Seconds 3
     }
 }
 
-# Restart all configured AXM services and their dependents
-if ($axmServices.Count -gt 0) {
+
+if ($servicesToStop -and $servicesToStop.Count -gt 0) {
     Write-Host "`nStarting all configured services in dependency order..." -ForegroundColor Cyan
-    
-    # Add a longer delay before starting services to allow system to settle and permissions to take effect
-    Write-Host "Waiting for system to stabilize (15 seconds)..." -ForegroundColor Yellow
+    Write-Host "Waiting 15 seconds before starting to allow system to stabilize..." -ForegroundColor Yellow
     Start-Sleep -Seconds 15
-    
-    $restartCount = 0
-    
-    # Create a function to recursively start a service and its dependencies
-    function Start-ServiceWithDependencies {
-        param(
-            [string]$ServiceName,
-            [hashtable]$StartedServices
-        )
-        
-        if ($StartedServices.ContainsKey($ServiceName)) {
-            return
-        }
-        
-        $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
-        if (-not $svc) {
-            Write-Host "Service $ServiceName not found." -ForegroundColor Red
-            $StartedServices[$ServiceName] = $false
-            return
-        }
-        
-        foreach ($dep in $svc.ServicesDependedOn) {
-            if (-not $StartedServices.ContainsKey($dep.Name)) {
-                Start-ServiceWithDependencies -ServiceName $dep.Name -StartedServices $StartedServices
-                Start-Sleep -Seconds 3
-            }
-        }
-        
-        try {
-            if ($svc.Status -ne 'Running') {
-                Write-Host "Attempting to start: $ServiceName" -ForegroundColor Yellow
-                Start-Service -Name $ServiceName -ErrorAction Stop
-                
-                Start-Sleep -Seconds 2
-                $svcStatus = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
-                
-                if ($svcStatus.Status -eq 'Running') {
-                    Write-Host "Started service: $ServiceName" -ForegroundColor Green
-                    $StartedServices[$ServiceName] = $true
-                } else {
-                    Write-Host "Service $ServiceName started but not running. Status: $($svcStatus.Status)" -ForegroundColor Red
-                    $StartedServices[$ServiceName] = $false
-                }
-            } else {
-                Write-Host "Service already running: $ServiceName" -ForegroundColor Cyan
-                $StartedServices[$ServiceName] = $true
-            }
-        } catch {
-            Write-Host "Error starting service $ServiceName : $_" -ForegroundColor Red
-            $StartedServices[$ServiceName] = $false
-        }
-    }
-    
+
     $startedServices = @{}
     $servicesToRestart = $servicesToStop | Sort-Object -Property Name -Unique
 
-    foreach ($service in $servicesToRestart) {
-        Start-ServiceWithDependencies -ServiceName $service.Name -StartedServices $startedServices
-        Start-Sleep -Seconds 5
+    foreach ($s in $servicesToRestart) {
+        Start-ServiceWithDependencies -ServiceName $s.Name -StartedServices $startedServices
+        Start-Sleep -Seconds 3
     }
-    
+
     $restartCount = ($startedServices.Values | Where-Object { $_ -eq $true }).Count
     Write-Host "`nSuccessfully started $restartCount of $($servicesToRestart.Count) touched services." -ForegroundColor Cyan
 
+    # Validate configured services
     Write-Host "`nValidating configured AXM services..." -ForegroundColor Cyan
-    $validationSuccess = Validate-AXMServices -Services $axmServices -ExpectedAccount $accountName
+    $validationSuccess = Validate-AXMServices -Services $configTargets -ExpectedAccount $accountName
     if (-not $validationSuccess) {
-        Write-Host "One or more AXM services did not validate successfully. Review the service state and StartName above." -ForegroundColor Yellow
+        Write-Host "One or more AXM services did not validate successfully. Review StartName and service state above, and check the System event log for logon failures (e.g., EventID 1069)." -ForegroundColor Yellow
     } else {
         Write-Host "All configured services validated successfully." -ForegroundColor Green
     }
+} else {
+    Write-Host "No services were configured; nothing to start." -ForegroundColor Yellow
 }
 
 Write-Host "`nService user seating complete!" -ForegroundColor Green
