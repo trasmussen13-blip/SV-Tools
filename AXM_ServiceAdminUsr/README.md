@@ -23,10 +23,7 @@ The script automates:
 - Grant "Log On As A Service"
 - Assign to services:
   - axm*
-  - vnhost*
-  - comnode*
-  - CommNodeSrv
-  - VnHostSrv
+
 - Configure services using CIM/WMI with fallback to `sc.exe`
 - Restart services in dependency-aware order
 - Validate final state
