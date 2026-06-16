@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>AXM - Disconnect SV</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 40px; }
+        button { margin: 10px; padding: 10px 20px; font-size: 16px; }
+        #response { margin-top: 20px; padding: 10px; border: 1px solid #ccc; min-height: 40px; }
+    </style>
+</head>
+<body>
+    <h2>AXM Disconnect</h2>
+    <button id="axmLiteBtn">AXM Lite</button>
+    <button id="axmClassicBtn">AXM Classic</button>
+    <div id="response"></div>
+
+    <script>
+        async function sendDisconnect(url) {
+            const responseDiv = document.getElementById('response');
+            responseDiv.textContent = 'Sending request...';
+            try {
+                const res = await fetch(url, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'accept': 'application/json'
+                    },
+                    body: JSON.stringify({})
+                });
+                if (res.status === 200) {
+                    responseDiv.textContent = 'Completed';
+                } else {
+                    responseDiv.textContent = 'Failed';
+                }
+            } catch (err) {
+                responseDiv.textContent = `Error: ${err}`;
+            }
+        }
+
+        document.getElementById('axmLiteBtn').onclick = function() {
+            sendDisconnect('http://localhost:5200/api/process-command/Disconnect');
+        };
+        document.getElementById('axmClassicBtn').onclick = function() {
+            sendDisconnect('http://localhost:5100/api/process-command/Disconnect');
+        };
+    </script>
+</body>
+</html>
